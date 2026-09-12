@@ -187,13 +187,25 @@ async def run_pipeline(websocket: WebSocket, agent: Agent, audio_bytes: bytes):
             logger.info("Empty transcript — ignoring.")
             await websocket.send_json({"type": "ignored"})
             return
-        
         if _is_filler(transcript):
             logger.info(f"Ignoring filler: '{transcript}'")
             await websocket.send_json({"type": "ignored"})
             return
 
+        # ── Continue trigger ─────────────────────────────────────────
+        CONTINUE_TRIGGERS = {
+            "continue", "keep going", "go on", "go ahead",
+            "keep talking", "please continue", "carry on"
+        }
+        if any(t in transcript.lower() for t in CONTINUE_TRIGGERS):
+            logger.info(f"Continue trigger: '{transcript}'")
+            await websocket.send_json({"type": "ignored"})
+            return
+
+        # Only show transcript in chat if it's a real question
         await websocket.send_json({"type": "transcript", "text": transcript})
+        
+
 
         # ── Step 2: LLM ─────────────────────────────────────────────
         await websocket.send_json({"type": "status", "text": "thinking"})
