@@ -13,6 +13,8 @@ KNOWLEDGE = open("knowledge.txt").read()
 
 SYSTEM_PROMPT = SYSTEM_PROMPT = f"""You are a helpful voice-based customer support agent for an online store.
 You can answer questions AND handle real customer requests through conversation.
+Do NOT include reasoning, thinking, or explanation — only the final answer.
+
 
 KNOWLEDGE BASE:
 {KNOWLEDGE}
@@ -59,10 +61,7 @@ class Agent:
 
     async def respond(self, user_text: str) -> str:
         """Generate a response to user input."""
-        # Add user message to history
         self.history.append({"role": "user", "content": user_text})
-
-        # Keep last 6 turns to avoid context overflow
         recent = self.history[-6:]
 
         try:
@@ -72,19 +71,54 @@ class Agent:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     *recent,
                 ],
-                max_tokens=150,      # short answers for voice
+                max_tokens=200,
                 temperature=0.5,
             )
-            answer = response.choices[0].message.content.strip()
+            
+            message = response.choices[0].message
+            
+            # Handle reasoning models (qwen, deepseek etc.)
+            # that return content separately from reasoning
+            answer = ""
+            if hasattr(message, 'reasoning') and message.reasoning:
+                # reasoning is separate — content is the actual answer
+                answer = (message.content or "").strip()
+            else:
+                answer = (message.content or "").strip()
 
-            # Add agent response to history
+            # Strip any leftover CONTENT: or REASONING: prefixes
+            for prefix in ["CONTENT:", "REASONING:", "Answer:", "Response:"]:
+                if answer.startswith(prefix):
+                    answer = answer[len(prefix):].strip()
+
+            if not answer:
+                answer = "I'm sorry, I couldn't generate a response. Please try again."
+
             self.history.append({"role": "assistant", "content": answer})
             logger.info(f"Q: {user_text[:60]} | A: {answer[:60]}")
             return answer
 
         except Exception as e:
+            error_str = str(e)
             logger.error(f"Groq error: {e}")
-            return "I'm having trouble connecting right now. Please try again or call 18001234"
+            
+            # Extract answer from tool_use_failed errors
+            # The model answered correctly but wrapped it in a tool call
+            if 'failed_generation' in error_str and 'arguments' in error_str:
+                try:
+                    import re
+                    # Extract text after "arguments":
+                    match = re.search(r'"arguments":\s*(.+?)\}\'', error_str)
+                    if match:
+                        answer = match.group(1).strip().strip('"')
+                        if answer:
+                            self.history.append({"role": "assistant", "content": answer})
+                            logger.info(f"Recovered from tool error: {answer[:60]}")
+                            return answer
+                except Exception:
+                    pass
+            
+            return "I'm having trouble connecting right now. Please try again or call 1-800-HELP-NOW."
 
     def clear_history(self):
         self.history = []
