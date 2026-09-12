@@ -256,8 +256,8 @@ const WS_URL = `ws://${location.host}/ws`;
 const SILENCE_TIMEOUT_MS = 2500;       // hangover after last real speech
 const PRE_SPEECH_TIMEOUT_MS = 7000;    // wait this long for the user to start talking
 const MIN_RECORD_MS = 1200;            // never auto-stop before this
-const SPEECH_RMS_THRESHOLD = 3.5;      // 0–100 RMS; enough to count as speech
-const INTERRUPT_RMS_THRESHOLD = 6.5;   // speech while agent is talking
+const SPEECH_RMS_THRESHOLD = 4;      // 0–100 RMS; enough to count as speech
+const INTERRUPT_RMS_THRESHOLD = 5.5;   // speech while agent is talking
 const CLICK_IGNORE_MS = 200;           // skip mouse/keyboard clicks; speech is longer
 
 // ── State ────────────────────────────────────────────────────────────
