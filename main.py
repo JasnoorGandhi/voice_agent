@@ -135,6 +135,11 @@ _FILLER_WORDS = {
     "yes", "no", "nope", "nah", "uh", "um", "uhh", "umm",
     "ah", "oh", "huh", "hm", "mmm", "ooh", "ugh", "right",
     "sure", "alright", "allright", "gotcha", "thanks",
+    # Whisper hallucinations of filler sounds:
+    "bye", "goodbye", "thank you", "thankyou", "please",
+    "hi", "hey", "hello", "good", "great", "nice", "cool",
+    "wait", "stop", "go", "done", "fine", "wow", "see",
+    "you", "i", "the", "a", "and", "or", "but",
 }
 _FILLER_PHRASES = {
     "got it", "uh huh", "uh-huh", "mm hmm", "mm-hmm", "mm hm",
@@ -144,7 +149,6 @@ _FILLER_PHRASES = {
 
 
 def _is_filler(transcript: str) -> bool:
-    """True for backchannels that should not replace the current answer."""
     cleaned = re.sub(r"[^a-z\s]", " ", transcript.lower())
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
@@ -152,7 +156,13 @@ def _is_filler(transcript: str) -> bool:
     if cleaned in _FILLER_PHRASES or cleaned in _FILLER_WORDS:
         return True
     words = cleaned.split()
-    return len(words) <= 3 and all(w in _FILLER_WORDS for w in words)
+    # Stricter: under 4 words, all fillers
+    if len(words) <= 4 and all(w in _FILLER_WORDS for w in words):
+        return True
+    # Under 3 words total is almost always a mishear
+    if len(words) <= 2:
+        return True
+    return False
 
 
 # ------------------------------------------------------------------
@@ -177,6 +187,7 @@ async def run_pipeline(websocket: WebSocket, agent: Agent, audio_bytes: bytes):
             logger.info("Empty transcript — ignoring.")
             await websocket.send_json({"type": "ignored"})
             return
+        
         if _is_filler(transcript):
             logger.info(f"Ignoring filler: '{transcript}'")
             await websocket.send_json({"type": "ignored"})
