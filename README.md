@@ -3,6 +3,8 @@
 A voice-based customer support agent you can interrupt mid-sentence.
 Speak in your browser, hear it answer, talk over it — it stops immediately.
 
+---
+
 ## The Core Feature
 
 Most voice demos only work when you wait politely. This one doesn't.
@@ -11,108 +13,335 @@ Start speaking while the agent is talking — it stops instantly, cancels everyt
 upstream, and responds to what you just said. Nothing keeps running or billing you
 for audio nobody will hear.
 
-**Measured interruption latency: ~80–150ms** (audio stops client-side instantly,
-server pipeline cancelled within one event loop tick).
+**Measured interruption latency: ~80–150ms**
+Audio stops client-side instantly (`audio.pause()`), server pipeline cancelled
+within one asyncio event loop tick. Latency badge shown after every interrupt.
+
+---
 
 ## Architecture
 
 ```
-Browser mic → WebSocket → STT (Whisper) → LLM (Groq) → TTS (Edge TTS) → Browser speaker
-                ↑
-        User speaks while agent talks
-                ↓
-        audioElement.pause()  ← instant (client-side)
-        ws.send({type:"interrupt"})
-        asyncio.Task.cancel() ← server cancels pipeline
+┌─────────────────────────────────────────────────────────┐
+│                        BROWSER                          │
+│                                                         │
+│  Microphone → RMS Volume Monitor (always-on)            │
+│       │                                                 │
+│       ├─ Agent speaking + RMS > threshold               │
+│       │         → audio.pause() [instant]               │
+│       │         → ws.send({type:"interrupt"})           │
+│       │         → startRecording()                      │
+│       │                                                 │
+│       └─ Mic button pressed                             │
+│                 → stopAgentNow()                        │
+│                 → startRecording()                      │
+│                                                         │
+│  MediaRecorder → silence detection → sendAudio()        │
+│       │                                                 │
+│       └─ WebSocket → base64 audio → server              │
+└─────────────────────────────────────────────────────────┘
+                          │  WebSocket /ws
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│                       SERVER                            │
+│                                                         │
+│  WebSocket handler                                      │
+│       │                                                 │
+│       ├─ {type:"interrupt"} → asyncio.Task.cancel()     │
+│       │         → CancelledError propagates             │
+│       │         → nothing more runs or bills            │
+│       │                                                 │
+│       └─ {type:"audio"} → asyncio.create_task()        │
+│                                                         │
+│  Pipeline Task (fully cancellable):                     │
+│       │                                                 │
+│       ├─ Step 1: Whisper STT                            │
+│       │       → transcribe audio bytes                  │
+│       │       → filler/hallucination filter             │
+│       │       → cancellation checkpoint                 │
+│       │                                                 │
+│       ├─ Step 2: Groq LLM                               │
+│       │       → inject knowledge base as context        │
+│       │       → generate response (max 150 tokens)      │
+│       │       → cancellation checkpoint                 │
+│       │                                                 │
+│       └─ Step 3: Edge TTS                               │
+│               → synthesize speech                       │
+│               → cancellation checkpoint                 │
+│               → send base64 audio over WebSocket        │
+└─────────────────────────────────────────────────────────┘
 ```
+
+---
 
 ## How Interruption Works
 
-1. Volume monitor runs continuously via Web Audio API `AnalyserNode`
-2. While agent audio plays, if user volume exceeds threshold → interrupt fires
-3. `audio.pause()` stops playback immediately — this is pure client-side, zero latency
-4. Server receives `{type: "interrupt"}` → calls `task.cancel()` on the running pipeline
-5. `asyncio.CancelledError` propagates through STT/LLM/TTS — nothing more runs
-6. New recording starts immediately to capture what the user is saying
+### Client side (instant)
+```javascript
+// RMS volume monitor runs on every animation frame
+function tick() {
+  const vol = rmsVolume(); // time-domain RMS, 0-100
+
+  if (agentSpeaking && vol > INTERRUPT_RMS_THRESHOLD) {
+    if (sustainedMs >= CLICK_IGNORE_MS) {
+      agentAudio.pause();    // stops playback instantly
+      agentSpeaking = false;
+      send({ type: 'interrupt' });
+      startRecording();      // immediately capture new query
+    }
+  }
+}
+```
+
+### Server side (cancellable pipeline)
+```python
+async def run_pipeline(websocket, agent, audio_bytes):
+    try:
+        transcript = await stt.transcribe(audio_bytes)
+        await asyncio.sleep(0)          # cancellation checkpoint
+
+        response = await agent.respond(transcript)
+        await asyncio.sleep(0)          # cancellation checkpoint
+
+        audio = await tts.synthesize(response)
+        await asyncio.sleep(0)          # cancellation checkpoint
+
+        await websocket.send_json({"type": "audio", "data": b64})
+
+    except asyncio.CancelledError:
+        raise  # clean exit, nothing more runs
+```
+
+---
+
+## Filler & Hallucination Detection
+
+Whisper often mishears short sounds as real words ("umm" → "bye", "mhm" → "thank you").
+Two layers of protection:
+
+**Layer 1 — RMS threshold (frontend)**
+Only sustained speech above `INTERRUPT_RMS_THRESHOLD = 6.5` RMS triggers recording.
+Short clicks (~5ms) and quiet fillers never cross this bar.
+
+**Layer 2 — Filler filter (server)**
+```python
+FILLERS = {"mhm", "hmm", "okay", "yeah", "uh", "um", ...}
+MISHEARS = {"bye", "thank you", "hi", "sure", "wait", ...}
+
+if _is_filler(transcript):
+    send({"type": "ignored"})  # agent resumes, nothing changes
+    return
+```
+
+When `ignored` is received, the frontend calls `resumePausedAgent()` — the agent
+continues speaking from where it was paused.
+
+---
+
+## RMS vs Volume
+
+The monitor uses **RMS (Root Mean Square)** — not frequency-based volume:
+
+```javascript
+// RMS: measures actual waveform deviation from silence
+analyser.getByteTimeDomainData(timeData);
+let sum = 0;
+for (let i = 0; i < timeData.length; i++) {
+  const v = (timeData[i] - 128) / 128;  // normalize -1 to +1
+  sum += v * v;
+}
+return Math.sqrt(sum / timeData.length) * 100;
+```
+
+RMS is more accurate for perceived loudness and less sensitive to constant
+background hum — making it much better for distinguishing real speech from noise.
+
+---
 
 ## Silence Detection (Trailing Off)
 
-The agent correctly handles:
-- `"I'd like the, um..."` — silence timer resets on any speech activity, waits longer
-- `"...that's all"` — 1.5s of silence triggers auto-stop and sends the query
+Handles "I'd like the, um..." vs "...that's all" correctly:
 
-The silence timer resets every time volume exceeds the speech threshold,
-so natural pauses mid-sentence don't cut the user off.
+```javascript
+const SILENCE_TIMEOUT_MS = 2500;   // wait 2.5s of silence before stopping
+const MIN_RECORD_MS = 1200;        // never stop before 1.2s of recording
+const SPEECH_RMS_THRESHOLD = 3.5;  // reset timer when speech detected
+```
+
+Every time speech is detected above `SPEECH_RMS_THRESHOLD`, the silence timer
+resets. Natural mid-sentence pauses keep the timer alive. Only genuine silence
+for 2.5 seconds triggers auto-stop and sends the audio.
+
+---
+
+## What the Agent Can Do
+
+Powered by Groq (Llama) with a knowledge base injected as context:
+
+**Answer questions about:**
+- Return policy (30-day window, process, non-returnable items)
+- Shipping (standard, express, next-day, international)
+- Order tracking and modifications
+- Payment methods
+- Warranty coverage
+- Contact and support options
+
+**Simulate actions (multi-turn conversation):**
+- Track an order — asks for order number, returns simulated status
+- Start a return — collects order number and reason, confirms return
+- Cancel an order — confirms cancellation, gives refund timeline
+- Book a support callback — collects name, phone, preferred time
+- Modify shipping address — asks for order number and new address
+
+---
 
 ## Stack
 
-| Component | Tech | Why |
+| Component | Technology | Why |
 |---|---|---|
-| STT | OpenAI Whisper (local) | No API cost, runs offline |
-| LLM | Groq Llama 3.1 8B | Fastest inference, free tier |
+| STT | OpenAI Whisper (local, base model) | No API cost, runs offline |
+| LLM | Groq (Llama via API) | Fastest inference, free tier |
 | TTS | Microsoft Edge TTS | Free, natural neural voices |
 | Backend | FastAPI + WebSockets | Async-native, cancellable tasks |
-| Frontend | Vanilla JS | No build step, instant setup |
+| Frontend | Vanilla JS + Web Audio API | No build step, instant setup |
+
+---
+
+## Project Structure
+
+```
+voice_agent/
+├── main.py          # FastAPI server, WebSocket handler, pipeline orchestration
+├── agent.py         # Groq LLM with knowledge base context injection
+├── stt.py           # Whisper STT (Windows-safe temp file handling)
+├── tts.py           # Edge TTS synthesis
+├── knowledge.txt    # Customer support document set
+├── .env             # API keys and config (not committed)
+├── .env.example     # Template
+├── requirements.txt
+└── frontend/
+    └── index.html   # Complete UI — RMS monitor, recording, playback, WebSocket
+```
+
+---
 
 ## Setup
 
+### Prerequisites
+- Python 3.11
+- FFmpeg on PATH ([download](https://www.gyan.dev/ffmpeg/builds/) → extract → add bin/ to PATH)
+- Groq API key ([console.groq.com](https://console.groq.com) — free, no credit card)
+
+### Install
+
 ```bash
-# 1. Clone and enter
+# 1. Clone
 git clone https://github.com/yourusername/voice-agent
 cd voice-agent
 
-# 2. Create venv with Python 3.11
+# 2. Virtual environment (Python 3.11 required)
 py -3.11 -m venv venv
 venv\Scripts\activate       # Windows
 source venv/bin/activate    # Mac/Linux
 
-# 3. Install dependencies
+# 3. Dependencies
 pip install -r requirements.txt
 
-# 4. Configure
+# 4. Environment
 copy .env.example .env      # Windows
 cp .env.example .env        # Mac/Linux
-# Edit .env and add your GROQ_API_KEY
+```
 
-# 5. Install ffmpeg (required by Whisper)
-# Windows: https://www.gyan.dev/ffmpeg/builds/
-# Add ffmpeg/bin to PATH
+Edit `.env`:
+```env
+GROQ_API_KEY=your-groq-key-here
+GROQ_MODEL=groq/compound-mini
+WHISPER_MODEL=base
+```
 
-# 6. Run
+### Run
+
+```bash
 python main.py
-
-# 7. Open browser
-# http://localhost:8000
 ```
 
-## Demo Scenarios
+Open **http://localhost:8000** in your browser.
 
-The demo video shows:
+---
 
-1. **Clean exchange** — "What's your return policy?" — full answer, no interruption
-2. **Hard interruption** — agent mid-sentence, user starts talking → stops immediately
-3. **Chained interruption** — interrupt → immediately ask new question → correct answer
-4. **Trailing off** — "I'd like to know about... actually, what about shipping?" — handles pause correctly
+## Demo Script
 
-## Tuning Interruption Sensitivity
+Run these scenarios in order for the demo video:
 
-In `frontend/index.html`:
+### 1. Clean exchange
+```
+Say: "What is your return policy?"
+Let it finish completely.
+```
+Expected: Full answer about 30-day returns, no interruption.
 
-```js
-const INTERRUPT_VOLUME_THRESHOLD = 18;  // lower = more sensitive
-const SPEECH_VOLUME_THRESHOLD = 8;      // min volume to count as speech
-const SILENCE_TIMEOUT_MS = 1500;        // ms of silence before auto-stop
+### 2. Hard interruption mid-sentence
+```
+Say: "Tell me about your shipping options"
+Wait for it to start speaking...
+Mid-sentence say: "Actually, how do I track my order?"
+```
+Expected: Stops immediately, green ⚡ badge shows latency, answers tracking question.
+
+### 3. Chained interruption
+```
+Say: "What payment methods do you accept?"
+As it answers, say: "Do you accept PayPal specifically?"
+```
+Expected: Interrupts, answers the specific PayPal question correctly.
+
+### 4. Trailing off
+```
+Say: "I'd like to know about... actually, what are your shipping costs?"
+(pause 1-2 seconds after "about", then continue)
+```
+Expected: Waits through the pause, processes the full question correctly.
+
+### 5. Action simulation
+```
+Say: "I want to track my order"
+Agent asks for order number → Say: "It's 12345"
+```
+Expected: Multi-turn conversation, simulates tracking result.
+
+### 6. Filler resilience (bonus)
+```
+While agent is speaking, say "mhm" or "okay" quietly
+```
+Expected: Agent does NOT stop — continues speaking.
+
+---
+
+## Tuning
+
+Adjust these constants in `frontend/index.html`:
+
+```javascript
+const SILENCE_TIMEOUT_MS = 2500;      // longer = more patient with pauses
+const MIN_RECORD_MS = 1200;           // minimum recording before auto-stop
+const SPEECH_RMS_THRESHOLD = 3.5;    // lower = more sensitive to quiet speech
+const INTERRUPT_RMS_THRESHOLD = 6.5; // higher = harder to accidentally interrupt
+const CLICK_IGNORE_MS = 200;         // ms of sustained sound before interrupt fires
 ```
 
-In a quiet room, lower `INTERRUPT_VOLUME_THRESHOLD` to 12.
-In a noisy environment, raise it to 25–30.
+**In a quiet room:** lower `INTERRUPT_RMS_THRESHOLD` to 4.0  
+**In a noisy room:** raise `INTERRUPT_RMS_THRESHOLD` to 8.0–10.0
+
+---
 
 ## Known Limitations
 
-- Whisper runs on CPU — transcription takes 2–5s for short clips
-- "mhm" / filler sounds: mitigated by volume threshold but not VAD
-  (full webrtcvad integration would handle this better)
-- Interruption works best when the volume difference is clear
+- Whisper runs on CPU — transcription takes 2–4s for short clips
+- Filler filter catches common mishears but not all Whisper hallucinations
+- Full webrtcvad integration would give better VAD than RMS thresholding
+- Edge TTS requires internet connection (Microsoft servers)
+
+---
 
 ## License
 
