@@ -51,7 +51,7 @@ function stopAgentNow({ hard = false } = {}) {
 ### Why this number is meaningful
 
 - `audio.pause()` is purely client-side — zero network round trip involved
-- The 150–250ms is dominated by `CLICK_IGNORE_MS = 200ms` — the deliberate
+- The 200–250ms is dominated by `CLICK_IGNORE_MS = 200ms` — the deliberate
   wait to confirm real speech vs a click or filler sound
 - Reducing `CLICK_IGNORE_MS` to 100ms would cut latency to ~100ms but
   increases false triggers from clicks and quiet fillers
