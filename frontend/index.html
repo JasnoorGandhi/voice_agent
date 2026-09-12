@@ -343,9 +343,11 @@ function connect() {
       removeTyping();
       if (interruptTimestamp) {
         const latency = Math.round(performance.now() - interruptTimestamp);
-        interruptMs.textContent = latency;
-        interruptBadge.classList.add('visible');
-        setTimeout(() => interruptBadge.classList.remove('visible'), 3000);
+        if(latency<1000){
+          interruptMs.textContent = latency;
+          interruptBadge.classList.add('visible');
+          setTimeout(() => interruptBadge.classList.remove('visible'), 3000);
+        }
         interruptTimestamp = null;
       }
 
@@ -470,7 +472,7 @@ function resetSilenceTimer(ms = SILENCE_TIMEOUT_MS) {
 
 // ── Recording ─────────────────────────────────────────────────────────
 function stopAgentNow({ hard = false } = {}) {
-  interruptTimestamp = performance.now();
+  const stopTime = performance.now();
   agentAudio.pause();
   agentSpeaking = false;
   if (hard) {
@@ -479,6 +481,18 @@ function stopAgentNow({ hard = false } = {}) {
     send({ type: 'interrupt' });
   } else {
     pausedForBargeIn = true;
+  }
+
+  // Show latency immediately — audio.pause() is the real stop moment
+  // No need to wait for server confirmation
+  if (interruptTimestamp) {
+    const latency = Math.round(stopTime - interruptTimestamp);
+    if (latency > 0 && latency < 800) {
+      interruptMs.textContent = latency;
+      interruptBadge.classList.add('visible');
+      setTimeout(() => interruptBadge.classList.remove('visible'), 3000);
+    }
+    interruptTimestamp = null;
   }
 }
 
@@ -557,6 +571,7 @@ async function sendAudio() {
 
 function toggleMic() {
   if (agentSpeaking || (pausedForBargeIn && !isRecording)) {
+    interruptTimestamp = performance.now();
     stopAgentNow({ hard: true });
   }
   if (isRecording) stopRecording();
@@ -669,7 +684,10 @@ async function startBackgroundMonitor() {
 
       // Stop the agent as soon as speech starts; ignore sub-120ms clicks
       if (agentSpeaking && !isRecording && vol > INTERRUPT_RMS_THRESHOLD) {
-        if (!bargeInStartedAt) bargeInStartedAt = performance.now();
+        if (!bargeInStartedAt){
+          bargeInStartedAt = performance.now();
+          interruptTimestamp=performance.now();
+        }
         volRing.classList.add('active');
         if (performance.now() - bargeInStartedAt >= CLICK_IGNORE_MS) {
           bargeInStartedAt = 0;
